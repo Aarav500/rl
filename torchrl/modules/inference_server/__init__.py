@@ -3,10 +3,15 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from torchrl._comm.transport import TransportConfig, TransportKind
 from torchrl.modules.inference_server._client import PolicyClientModule
 from torchrl.modules.inference_server._config import (
     InferenceDeviceConfig,
     InferenceServerConfig,
+)
+from torchrl.modules.inference_server._factory import (
+    inference_transport_kind,
+    make_inference_transport,
 )
 from torchrl.modules.inference_server._monarch import MonarchTransport
 from torchrl.modules.inference_server._mp import MPTransport
@@ -35,4 +40,8 @@ __all__ = [
     "SharedMemoryTransport",
     "SlotTransport",
     "ThreadingTransport",
+    "TransportConfig",
+    "TransportKind",
+    "inference_transport_kind",
+    "make_inference_transport",
 ]

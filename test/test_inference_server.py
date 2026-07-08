@@ -25,21 +25,29 @@ from tensordict.nn.probabilistic import (
     set_interaction_type,
 )
 from torchrl._comm import (
+    as_transport_config,
     CommandChannel,
+    get_transport_resolver,
     Mailbox,
     MailboxPeerClosedError,
     MailboxTransportError,
     MappingRendezvous,
+    normalize_transport_kind,
+    register_transport_resolver,
+    resolve_transport,
     SharedBlock,
     TCPStoreRendezvous,
+    TransportConfig,
 )
 
 from torchrl.modules.inference_server import (
+    inference_transport_kind,
     InferenceClient,
     InferenceDeviceConfig,
     InferenceServer,
     InferenceServerConfig,
     InferenceTransport,
+    make_inference_transport,
     MPTransport,
     PolicyClientModule,
     ProcessInferenceServer,
@@ -1334,6 +1342,222 @@ class TestSharedMemoryTransport:
 
 
 # =============================================================================
+# Tests: transport selection (TransportConfig + make_inference_transport)
+# =============================================================================
+
+
+class TestTransportConfig:
+    def test_normalize_transport_kind(self):
+        assert normalize_transport_kind(None) == "auto"
+        assert normalize_transport_kind("shared_memory") == "shared_memory"
+        with pytest.raises(ValueError, match="Unsupported transport kind"):
+            normalize_transport_kind("bogus")
+
+    def test_config_validates_kind(self):
+        assert TransportConfig().kind == "auto"
+        assert TransportConfig("queue").options == {}
+        with pytest.raises(ValueError, match="Unsupported transport kind"):
+            TransportConfig("bogus")
+
+    def test_config_copies_options(self):
+        options = {"num_slots": 4}
+        config = TransportConfig("shared_memory", options)
+        options["num_slots"] = 8
+        assert config.options["num_slots"] == 4
+
+    def test_as_transport_config(self):
+        assert as_transport_config(None) == TransportConfig("auto")
+        config = as_transport_config("queue", {"use_manager": True})
+        assert config.kind == "queue"
+        assert config.options == {"use_manager": True}
+        existing = TransportConfig("ray")
+        assert as_transport_config(existing) is existing
+        with pytest.raises(ValueError, match="cannot be combined"):
+            as_transport_config(existing, {"num_slots": 4})
+        with pytest.raises(TypeError, match="transport must be"):
+            as_transport_config(ThreadingTransport())
+
+    def test_resolver_registry(self):
+        assert get_transport_resolver("inference") is make_inference_transport
+        with pytest.raises(KeyError, match="No transport resolver"):
+            get_transport_resolver("no_such_domain")
+        with pytest.raises(ValueError, match="already registered"):
+            register_transport_resolver("inference", make_inference_transport)
+        # overwrite=True re-registers without raising
+        register_transport_resolver(
+            "inference", make_inference_transport, overwrite=True
+        )
+        transport = resolve_transport("inference", "queue")
+        assert isinstance(transport, ThreadingTransport)
+
+
+class TestMakeInferenceTransport:
+    def test_auto_threading(self):
+        transport = make_inference_transport(policy_backend="threading")
+        assert isinstance(transport, ThreadingTransport)
+        transport = make_inference_transport(
+            "auto", policy_backend="threading", num_slots=4
+        )
+        assert isinstance(transport, SlotTransport)
+        assert transport._num_slots == 4
+
+    def test_auto_multiprocessing(self):
+        transport = make_inference_transport(policy_backend="multiprocessing")
+        assert isinstance(transport, MPTransport)
+        request_spec, response_spec = _make_shm_specs()
+        transport = make_inference_transport(
+            policy_backend="multiprocessing",
+            num_slots=8,
+            request_spec=request_spec,
+            response_spec=response_spec,
+        )
+        assert isinstance(transport, SharedMemoryTransport)
+
+    def test_auto_partial_specs_raise(self):
+        request_spec, _ = _make_shm_specs()
+        with pytest.raises(ValueError, match="only one of"):
+            make_inference_transport(
+                policy_backend="multiprocessing",
+                num_slots=8,
+                request_spec=request_spec,
+            )
+
+    def test_forced_kinds(self):
+        assert isinstance(make_inference_transport("queue"), ThreadingTransport)
+        assert isinstance(
+            make_inference_transport("queue", policy_backend="multiprocessing"),
+            MPTransport,
+        )
+        assert isinstance(
+            make_inference_transport("direct", num_slots=2), SlotTransport
+        )
+        request_spec, response_spec = _make_shm_specs()
+        transport = make_inference_transport(
+            "shared_memory",
+            num_slots=2,
+            request_spec=request_spec,
+            response_spec=response_spec,
+        )
+        assert isinstance(transport, SharedMemoryTransport)
+
+    def test_options_flow_through_config(self):
+        request_spec, response_spec = _make_shm_specs()
+        config = TransportConfig(
+            "shared_memory",
+            {
+                "request_spec": request_spec,
+                "response_spec": response_spec,
+                "num_slots": 2,
+                "copy_result": False,
+            },
+        )
+        transport = make_inference_transport(config)
+        assert isinstance(transport, SharedMemoryTransport)
+        assert transport._copy_result is False
+
+    def test_incompatible_combinations_raise(self):
+        request_spec, response_spec = _make_shm_specs()
+        with pytest.raises(ValueError, match="requires a static payload"):
+            make_inference_transport(
+                "shared_memory", policy_backend="multiprocessing", num_slots=2
+            )
+        with pytest.raises(ValueError, match="requires num_slots"):
+            make_inference_transport(
+                "shared_memory",
+                policy_backend="multiprocessing",
+                request_spec=request_spec,
+                response_spec=response_spec,
+            )
+        with pytest.raises(ValueError, match="redundant"):
+            make_inference_transport("shared_memory", policy_backend="threading")
+        with pytest.raises(ValueError, match="same-node actors"):
+            make_inference_transport("shared_memory", policy_backend="ray")
+        with pytest.raises(ValueError, match="in-process actors"):
+            make_inference_transport("direct", policy_backend="multiprocessing")
+        with pytest.raises(ValueError, match="not supported"):
+            make_inference_transport("queue", policy_backend="ray")
+        with pytest.raises(ValueError, match="not supported"):
+            make_inference_transport("ray", policy_backend="multiprocessing")
+        with pytest.raises(ValueError, match="not implemented"):
+            make_inference_transport("rpc")
+        with pytest.raises(ValueError, match="not implemented"):
+            make_inference_transport("distributed")
+        with pytest.raises(ValueError, match="Unknown policy_backend"):
+            make_inference_transport("auto", policy_backend="bogus")
+
+    def test_instance_passthrough(self):
+        transport = ThreadingTransport()
+        assert make_inference_transport(transport) is transport
+        with pytest.raises(ValueError, match="cannot be combined"):
+            make_inference_transport(transport, transport_options={"num_slots": 2})
+
+    def test_inference_transport_kind(self):
+        request_spec, response_spec = _make_shm_specs()
+        assert inference_transport_kind(ThreadingTransport()) == "queue"
+        assert inference_transport_kind(MPTransport()) == "queue"
+        assert inference_transport_kind(SlotTransport(2)) == "direct"
+        assert (
+            inference_transport_kind(
+                SharedMemoryTransport(request_spec, response_spec, num_slots=2)
+            )
+            == "shared_memory"
+        )
+        assert inference_transport_kind(_MockTransport()) == "custom"
+
+
+class TestServerTransportSelection:
+    def test_server_accepts_string_transport(self):
+        policy = _make_policy()
+        server = InferenceServer(policy, "auto", max_batch_size=4)
+        assert isinstance(server.transport, ThreadingTransport)
+        assert server.transport_kind == "queue"
+        assert server.transport_config == TransportConfig("auto")
+        with server:
+            client = server.client()
+            result = client(TensorDict({"observation": torch.randn(4)}))
+        assert result["action"].shape == (2,)
+
+    def test_server_injected_instance_reports_none_config(self):
+        policy = _make_policy()
+        transport = ThreadingTransport()
+        server = InferenceServer(policy, transport, max_batch_size=4)
+        assert server.transport is transport
+        assert server.transport_config is None
+        assert server.transport_kind == "queue"
+        with pytest.raises(ValueError, match="cannot be combined"):
+            InferenceServer(
+                policy,
+                transport,
+                transport_options={"num_slots": 2},
+                max_batch_size=4,
+            )
+
+    def test_process_server_default_transport_is_mp(self):
+        server = ProcessInferenceServer(
+            policy_factory=_make_policy,
+            max_batch_size=4,
+        )
+        assert isinstance(server.transport, MPTransport)
+        assert server.transport_kind == "queue"
+        assert server.transport_config == TransportConfig("auto")
+
+    def test_process_server_auto_shared_memory_with_specs(self):
+        request_spec, response_spec = _make_shm_specs()
+        server = ProcessInferenceServer(
+            policy_factory=_make_policy,
+            transport="auto",
+            transport_options={
+                "request_spec": request_spec,
+                "response_spec": response_spec,
+                "num_slots": 4,
+            },
+            max_batch_size=4,
+        )
+        assert isinstance(server.transport, SharedMemoryTransport)
+        assert server.transport_kind == "shared_memory"
+
+
+# =============================================================================
 # Tests: RayTransport (Commit 4)
 # =============================================================================
 
@@ -2082,6 +2306,77 @@ class TestAsyncBatchedCollector:
         collector.shutdown()
         assert total >= 20
         assert stats["requests"] > 0
+
+
+class TestCollectorTransportSelection:
+    """Transport resolution through the AsyncBatchedCollector constructor."""
+
+    def _make_collector(self, **kwargs):
+        return AsyncBatchedCollector(
+            create_env_fn=[_counting_env_factory] * 3,
+            policy=_make_counting_policy(),
+            frames_per_batch=12,
+            **kwargs,
+        )
+
+    def test_default_threading_resolves_to_slots(self):
+        collector = self._make_collector()
+        assert isinstance(collector._transport, SlotTransport)
+        assert collector.transport_kind == "direct"
+        assert collector.transport_config == TransportConfig("auto")
+
+    def test_multiprocessing_auto_without_specs_resolves_to_queue(self):
+        collector = self._make_collector(policy_backend="multiprocessing")
+        assert isinstance(collector._transport, MPTransport)
+        assert collector.transport_kind == "queue"
+
+    def test_multiprocessing_auto_with_specs_resolves_to_shared_memory(self):
+        request_spec = TensorDict({"observation": torch.zeros(1)})
+        response_spec = TensorDict({"action": torch.zeros(1)})
+        collector = self._make_collector(
+            policy_backend="multiprocessing",
+            transport_options={
+                "request_spec": request_spec,
+                "response_spec": response_spec,
+            },
+        )
+        assert isinstance(collector._transport, SharedMemoryTransport)
+        # num_slots defaults to the number of envs
+        assert collector._transport._num_slots == 3
+        assert collector.transport_kind == "shared_memory"
+        assert collector.transport_config.kind == "auto"
+
+    def test_forced_queue_with_threading(self):
+        collector = self._make_collector(transport="queue")
+        assert isinstance(collector._transport, ThreadingTransport)
+        assert collector.transport_kind == "queue"
+
+    def test_incompatible_forced_kind_raises(self):
+        with pytest.raises(ValueError, match="redundant"):
+            self._make_collector(transport="shared_memory")
+
+    def test_injected_instance_with_options_raises(self):
+        with pytest.raises(ValueError, match="cannot be combined"):
+            self._make_collector(
+                transport=ThreadingTransport(),
+                transport_options={"num_slots": 2},
+            )
+
+    def test_injected_instance_reports_none_config(self):
+        transport = ThreadingTransport()
+        collector = self._make_collector(transport=transport)
+        assert collector._transport is transport
+        assert collector.transport_config is None
+        assert collector.transport_kind == "queue"
+
+    @pytest.mark.slow
+    def test_collect_with_forced_queue_transport(self):
+        collector = self._make_collector(transport="queue", total_frames=24)
+        total = 0
+        for batch in collector:
+            total += batch.numel()
+        collector.shutdown()
+        assert total >= 24
 
 
 # =============================================================================

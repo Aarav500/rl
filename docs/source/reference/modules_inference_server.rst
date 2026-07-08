@@ -38,6 +38,22 @@ Transport Backends
     RayTransport
     MonarchTransport
 
+Transport Selection
+-------------------
+
+.. autosummary::
+    :toctree: generated/
+    :template: rl_template_fun.rst
+
+    make_inference_transport
+    inference_transport_kind
+
+.. autosummary::
+    :toctree: generated/
+    :template: rl_template_noinherit.rst
+
+    TransportConfig
+
 Usage
 -----
 
@@ -112,6 +128,57 @@ all device transfers (batches are moved to ``policy_device`` before the
 forward pass, results copied back into the CPU response slots).
 ``num_slots`` bounds the number of concurrently in-flight requests and
 provides natural backpressure.
+
+Choosing placement and transport
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+TorchRL separates *where a service owner runs* from *how payloads move*:
+
+- ``service_backend`` (and the collector ``backend``/``policy_backend``
+  spellings) chooses ownership and placement: thread, process, Ray, Monarch.
+- ``transport`` chooses how request/response payloads move: ``"queue"``,
+  ``"shared_memory"``, ``"ray"``, ``"monarch"``, or ``"auto"``.
+- ``.client()`` hides both choices from consumer code.
+
+The ``transport`` argument of :class:`InferenceServer`,
+:class:`ProcessInferenceServer`, and
+:class:`~torchrl.collectors.AsyncBatchedCollector` accepts a concrete
+:class:`InferenceTransport` instance, a kind string, a
+:class:`~torchrl._comm.TransportConfig`, or ``None``/``"auto"``. Strings and
+configs are resolved deterministically by :func:`make_inference_transport`;
+``"auto"`` picks the fastest safe choice for the topology:
+
+- thread actors with a known slot count: :class:`SlotTransport` (direct
+  references, no serialization);
+- thread actors otherwise: :class:`ThreadingTransport`;
+- process actors with a static TensorDict contract (``request_spec`` and
+  ``response_spec`` provided): :class:`SharedMemoryTransport`;
+- process actors otherwise: :class:`MPTransport`;
+- Ray/Monarch actors: :class:`RayTransport` / :class:`MonarchTransport`.
+
+Forcing a kind that is incompatible with the topology raises instead of
+silently degrading, and the resolved choice is inspectable through the
+``transport_kind`` and ``transport_config`` properties:
+
+.. code-block:: python
+
+    from torchrl.collectors import AsyncBatchedCollector
+
+    collector = AsyncBatchedCollector(
+        create_env_fn=[make_env] * 8,
+        policy_factory=make_policy,
+        frames_per_batch=200,
+        policy_backend="multiprocessing",
+        transport="auto",
+        transport_options={
+            "request_spec": example_obs,      # single-request TensorDict
+            "response_spec": example_action,  # single-response TensorDict
+        },
+    )
+    assert collector.transport_kind == "shared_memory"
+
+Only the worker-facing configuration changes between transports; the env
+worker loop and the policy are untouched.
 
 Structured Configuration
 ^^^^^^^^^^^^^^^^^^^^^^^^

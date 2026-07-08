@@ -23,10 +23,19 @@ Example:
 from __future__ import annotations
 
 from torchrl._comm.backends import ServiceBackend
+from torchrl._comm.transport import TransportConfig, TransportKind
 from torchrl.services.base import Service, ServiceBase
 from torchrl.services.ray_service import RayService
 
-__all__ = ["Service", "ServiceBackend", "ServiceBase", "RayService", "get_services"]
+__all__ = [
+    "Service",
+    "ServiceBackend",
+    "ServiceBase",
+    "RayService",
+    "TransportConfig",
+    "TransportKind",
+    "get_services",
+]
 
 
 def get_services(backend: str = "ray", **init_kwargs) -> ServiceBase:

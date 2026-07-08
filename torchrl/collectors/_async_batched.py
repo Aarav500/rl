@@ -14,17 +14,23 @@ from typing import Literal
 import torch
 from tensordict import lazy_stack, NestedKey, TensorDictBase
 
-from torchrl._comm import MailboxTransportError
+from torchrl._comm import (
+    as_transport_config,
+    MailboxTransportError,
+    TransportConfig,
+    TransportKind,
+)
 from torchrl._utils import _maybe_record_function_decorator, logger as torchrl_logger
 from torchrl.collectors._base import BaseCollector
 from torchrl.envs import AsyncEnvPool, EnvBase
 from torchrl.modules.inference_server import (
+    inference_transport_kind,
     InferenceDeviceConfig,
     InferenceServer,
     InferenceServerConfig,
+    make_inference_transport,
     PolicyClientModule,
     ProcessInferenceServer,
-    ThreadingTransport,
 )
 from torchrl.modules.inference_server._transport import InferenceTransport
 
@@ -32,42 +38,6 @@ _ENV_IDX_KEY = "env_index"
 
 _POLICY_BACKENDS = ("threading", "multiprocessing", "ray", "monarch")
 _ENV_BACKENDS = ("threading", "multiprocessing")
-
-
-def _make_transport(
-    policy_backend: str, num_slots: int | None = None
-) -> InferenceTransport:
-    """Create an :class:`InferenceTransport` from a backend name.
-
-    Args:
-        policy_backend: one of ``"threading"``, ``"multiprocessing"``,
-            ``"ray"``, or ``"monarch"``.
-        num_slots: when set and ``policy_backend="threading"``, a
-            :class:`~torchrl.modules.SlotTransport` is created instead of
-            the generic :class:`~torchrl.modules.ThreadingTransport`.
-    """
-    if policy_backend == "threading":
-        if num_slots is not None:
-            from torchrl.modules.inference_server._slot import SlotTransport
-
-            return SlotTransport(num_slots)
-        return ThreadingTransport()
-    if policy_backend == "multiprocessing":
-        from torchrl.modules.inference_server._mp import MPTransport
-
-        return MPTransport()
-    if policy_backend == "ray":
-        from torchrl.modules.inference_server._ray import RayTransport
-
-        return RayTransport()
-    if policy_backend == "monarch":
-        from torchrl.modules.inference_server._monarch import MonarchTransport
-
-        return MonarchTransport()
-    raise ValueError(
-        f"Unknown policy_backend {policy_backend!r}. "
-        f"Expected one of {_POLICY_BACKENDS}."
-    )
 
 
 def _env_loop(
@@ -169,10 +139,27 @@ class AsyncBatchedCollector(BaseCollector):
             ``1`` (default) dispatches immediately.
         server_timeout (float, optional): seconds the server waits for work
             before dispatching a partial batch.  Defaults to ``0.01``.
-        transport (InferenceTransport, optional): a pre-built transport
-            object.  When provided, it takes precedence over
-            ``policy_backend``.  When ``None`` (default) a transport is
-            created automatically from the resolved ``policy_backend``.
+        transport (InferenceTransport, TransportConfig, str, optional): how
+            request/response payloads move between the env workers and the
+            inference server, independently of where things run
+            (``policy_backend``).  Accepts a pre-built
+            :class:`~torchrl.modules.InferenceTransport` (takes precedence
+            over ``policy_backend``), a
+            :data:`~torchrl._comm.TransportKind` string (e.g. ``"queue"``,
+            ``"shared_memory"``), a :class:`~torchrl._comm.TransportConfig`,
+            or ``None``/``"auto"`` (default) which resolves the fastest safe
+            transport for the topology through
+            :func:`~torchrl.modules.inference_server.make_inference_transport`
+            -- in particular, ``"auto"`` with
+            ``policy_backend="multiprocessing"`` picks the shared-memory
+            fast path when ``request_spec`` and ``response_spec`` are given
+            through ``transport_options``.  The resolved choice is
+            inspectable through :attr:`transport_kind` and
+            :attr:`transport_config`.
+        transport_options (dict, optional): kind-specific options for the
+            resolved transport (e.g. ``request_spec``, ``response_spec``,
+            ``num_slots``, ``copy_result``).  Only valid when ``transport``
+            is a string, a config, or ``None``.
         device (torch.device or str, optional): device for policy inference
             (shorthand for ``InferenceDeviceConfig(policy_device=...)``).
             Defaults to ``None``.
@@ -261,7 +248,12 @@ class AsyncBatchedCollector(BaseCollector):
         max_batch_size: int | None = None,
         min_batch_size: int | None = None,
         server_timeout: float | None = None,
-        transport: InferenceTransport | None = None,
+        transport: InferenceTransport
+        | TransportConfig
+        | TransportKind
+        | str
+        | None = None,
+        transport_options: dict | None = None,
         device: torch.device | str | None = None,
         backend: Literal[
             "threading", "multiprocessing", "ray", "monarch"
@@ -361,9 +353,19 @@ class AsyncBatchedCollector(BaseCollector):
         self._policy_backend = effective_policy_backend
 
         # ---- build transport --------------------------------------------------
-        if transport is None:
-            transport = _make_transport(
-                effective_policy_backend, num_slots=self._num_envs
+        if isinstance(transport, InferenceTransport):
+            if transport_options:
+                raise ValueError(
+                    "transport_options cannot be combined with a transport "
+                    "instance; configure the instance directly."
+                )
+            self._transport_config: TransportConfig | None = None
+        else:
+            self._transport_config = as_transport_config(transport, transport_options)
+            transport = make_inference_transport(
+                self._transport_config,
+                policy_backend=effective_policy_backend,
+                num_slots=self._num_envs,
             )
         self._transport = transport
 
@@ -507,6 +509,20 @@ class AsyncBatchedCollector(BaseCollector):
         if stats is None:
             return {}
         return stats(reset=reset)
+
+    @property
+    def transport_kind(self) -> str:
+        """How the inference transport moves payloads (e.g. ``"queue"``).
+
+        Derived from the concrete transport instance, so injected transports
+        are reported too; unknown transport classes report ``"custom"``.
+        """
+        return inference_transport_kind(self._transport)
+
+    @property
+    def transport_config(self) -> TransportConfig | None:
+        """The config the transport was resolved from (``None`` when injected)."""
+        return self._transport_config
 
     @property
     def policy_version(self) -> int:

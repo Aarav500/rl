@@ -23,7 +23,14 @@ from tensordict.nn.probabilistic import InteractionType, set_interaction_type
 from tensordict.utils import NestedKey
 from torch import nn
 
-from torchrl._comm import CommandChannel, Mailbox, watch_process_liveness
+from torchrl._comm import (
+    as_transport_config,
+    CommandChannel,
+    Mailbox,
+    TransportConfig,
+    TransportKind,
+    watch_process_liveness,
+)
 from torchrl.modules.inference_server._client import (
     _NO_INTERACTION_TYPE_CODE,
     _REMOTE_INTERACTION_TYPE_KEY,
@@ -31,6 +38,10 @@ from torchrl.modules.inference_server._client import (
 from torchrl.modules.inference_server._config import (
     InferenceDeviceConfig,
     InferenceServerConfig,
+)
+from torchrl.modules.inference_server._factory import (
+    inference_transport_kind,
+    make_inference_transport,
 )
 from torchrl.modules.inference_server._transport import InferenceTransport
 from torchrl.weight_update import (
@@ -79,6 +90,28 @@ def _normalize_tensordict_device_metadata(data: TensorDictBase) -> TensorDictBas
     return data.to(target_device)
 
 
+def _resolve_server_transport(
+    transport: InferenceTransport | TransportConfig | TransportKind | str | None,
+    transport_options: dict | None,
+    policy_backend: str | None,
+) -> tuple[InferenceTransport, TransportConfig | None]:
+    """Resolve a server ``transport`` argument to a transport instance.
+
+    Returns the transport plus the :class:`~torchrl._comm.TransportConfig`
+    it was resolved from (``None`` when an instance was injected directly).
+    """
+    if isinstance(transport, InferenceTransport):
+        if transport_options:
+            raise ValueError(
+                "transport_options cannot be combined with a transport "
+                "instance; configure the instance directly."
+            )
+        return transport, None
+    config = as_transport_config(transport, transport_options)
+    resolved = make_inference_transport(config, policy_backend=policy_backend)
+    return resolved, config
+
+
 def _default_collate(items: list[TensorDictBase]) -> TensorDictBase:
     return lazy_stack(
         [
@@ -101,9 +134,21 @@ class InferenceServer:
         model (nn.Module or Callable): a callable that maps a batched
             TensorDictBase to a batched TensorDictBase (e.g. a
             :class:`~tensordict.nn.TensorDictModule`).
-        transport (InferenceTransport): the communication backend.
+        transport (InferenceTransport, TransportConfig, str or None): the
+            communication backend: a concrete :class:`InferenceTransport`
+            instance, a :data:`~torchrl._comm.TransportKind` string, a
+            :class:`~torchrl._comm.TransportConfig`, or ``None``/``"auto"``
+            (resolves to a :class:`ThreadingTransport` -- the server has no
+            actor-topology context of its own; see
+            :func:`make_inference_transport`). The resolved choice is
+            inspectable through :attr:`transport_kind` and
+            :attr:`transport_config`.
 
     Keyword Args:
+        transport_options (dict, optional): kind-specific options consumed by
+            :func:`make_inference_transport` when ``transport`` is a string,
+            a config, or ``None``. Invalid together with a transport
+            instance.
         max_batch_size (int, optional): upper bound on the number of requests
             processed in a single forward pass. Default: ``64``.
         min_batch_size (int, optional): minimum number of requests to
@@ -176,8 +221,9 @@ class InferenceServer:
     def __init__(
         self,
         model: nn.Module,
-        transport: InferenceTransport,
+        transport: InferenceTransport | TransportConfig | TransportKind | str | None,
         *,
+        transport_options: dict | None = None,
         max_batch_size: int | None = None,
         min_batch_size: int | None = None,
         timeout: float | None = None,
@@ -245,6 +291,9 @@ class InferenceServer:
                 )
             policy_device = device_config.policy_device
             output_device = device_config.server_output_device()
+        transport, self._transport_config = _resolve_server_transport(
+            transport, transport_options, policy_backend=None
+        )
         self.model = model
         self.transport = transport
         self.max_batch_size = max_batch_size
@@ -442,6 +491,16 @@ class InferenceServer:
     def client(self) -> Any:
         """Return a restricted inference client from the owned transport."""
         return self.transport.client()
+
+    @property
+    def transport_kind(self) -> str:
+        """How the transport moves payloads (e.g. ``"queue"``, ``"shared_memory"``)."""
+        return inference_transport_kind(self.transport)
+
+    @property
+    def transport_config(self) -> TransportConfig | None:
+        """The config the transport was resolved from (``None`` when injected)."""
+        return self._transport_config
 
     # -- background loop ------------------------------------------------------
 
@@ -737,9 +796,23 @@ class ProcessInferenceServer:
     Args:
         policy_factory (Callable[[], nn.Module]): picklable factory that creates
             the policy inside the server process.
-        transport (InferenceTransport): transport shared with actor clients.
+        transport (InferenceTransport, TransportConfig, str or None): transport
+            shared with actor clients: a concrete :class:`InferenceTransport`
+            instance, a :data:`~torchrl._comm.TransportKind` string, a
+            :class:`~torchrl._comm.TransportConfig`, or ``None``/``"auto"``.
+            Strings and configs are resolved by
+            :func:`make_inference_transport` with
+            ``policy_backend="multiprocessing"`` (actors talk to this server
+            across processes), so ``"auto"`` picks
+            :class:`SharedMemoryTransport` when ``request_spec`` and
+            ``response_spec`` are given through ``transport_options`` and
+            :class:`MPTransport` otherwise.
 
     Keyword Args:
+        transport_options (dict, optional): kind-specific options consumed by
+            :func:`make_inference_transport` when ``transport`` is a string,
+            a config, or ``None``. Invalid together with a transport
+            instance.
         max_batch_size (int, optional): maximum requests per forward pass.
         min_batch_size (int, optional): minimum requests to accumulate before
             dispatching a partial batch.
@@ -797,7 +870,12 @@ class ProcessInferenceServer:
         self,
         *,
         policy_factory: Callable[[], nn.Module],
-        transport: InferenceTransport,
+        transport: InferenceTransport
+        | TransportConfig
+        | TransportKind
+        | str
+        | None = None,
+        transport_options: dict | None = None,
         max_batch_size: int | None = None,
         min_batch_size: int | None = None,
         timeout: float | None = None,
@@ -864,6 +942,9 @@ class ProcessInferenceServer:
                 )
             policy_device = device_config.policy_device
             output_device = device_config.server_output_device()
+        transport, self._transport_config = _resolve_server_transport(
+            transport, transport_options, policy_backend="multiprocessing"
+        )
         self.policy_factory = policy_factory
         self.transport = transport
         self.startup_timeout = startup_timeout
@@ -1026,6 +1107,16 @@ class ProcessInferenceServer:
     def client(self) -> Any:
         """Return a restricted inference client from the owned transport."""
         return self._service_client
+
+    @property
+    def transport_kind(self) -> str:
+        """How the transport moves payloads (e.g. ``"queue"``, ``"shared_memory"``)."""
+        return inference_transport_kind(self.transport)
+
+    @property
+    def transport_config(self) -> TransportConfig | None:
+        """The config the transport was resolved from (``None`` when injected)."""
+        return self._transport_config
 
     def stats(
         self, *, reset: bool = False, timeout: float = 5.0

@@ -25,6 +25,15 @@ from torchrl._comm.rendezvous import (
     TCPStoreRendezvous,
 )
 from torchrl._comm.shared import SharedBlock
+from torchrl._comm.transport import (
+    as_transport_config,
+    get_transport_resolver,
+    normalize_transport_kind,
+    register_transport_resolver,
+    resolve_transport,
+    TransportConfig,
+    TransportKind,
+)
 
 __all__ = [
     "CommandChannel",
@@ -42,6 +51,13 @@ __all__ = [
     "ServiceBackendAlias",
     "SharedBlock",
     "TCPStoreRendezvous",
+    "TransportConfig",
+    "TransportKind",
+    "as_transport_config",
+    "get_transport_resolver",
     "normalize_service_backend",
+    "normalize_transport_kind",
+    "register_transport_resolver",
+    "resolve_transport",
     "watch_process_liveness",
 ]
