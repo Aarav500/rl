@@ -9,6 +9,7 @@ from torchrl.modules.inference_server._config import (
     InferenceDeviceConfig,
     InferenceServerConfig,
 )
+from torchrl.modules.inference_server._distributed import DistributedTransport
 from torchrl.modules.inference_server._factory import (
     inference_transport_kind,
     make_inference_transport,
@@ -27,6 +28,7 @@ from torchrl.modules.inference_server._threading import ThreadingTransport
 from torchrl.modules.inference_server._transport import InferenceTransport
 
 __all__ = [
+    "DistributedTransport",
     "InferenceClient",
     "InferenceDeviceConfig",
     "InferenceServer",

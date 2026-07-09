@@ -41,6 +41,7 @@ from torchrl._comm import (
 )
 
 from torchrl.modules.inference_server import (
+    DistributedTransport,
     inference_transport_kind,
     InferenceClient,
     InferenceDeviceConfig,
@@ -1480,10 +1481,27 @@ class TestMakeInferenceTransport:
             make_inference_transport("ray", policy_backend="multiprocessing")
         with pytest.raises(ValueError, match="not implemented"):
             make_inference_transport("rpc")
-        with pytest.raises(ValueError, match="not implemented"):
-            make_inference_transport("distributed")
+        with pytest.raises(ValueError, match="requires a static payload"):
+            make_inference_transport("distributed", policy_backend="ray")
+        with pytest.raises(ValueError, match="thread actors"):
+            make_inference_transport("distributed", policy_backend="threading")
         with pytest.raises(ValueError, match="Unknown policy_backend"):
             make_inference_transport("auto", policy_backend="bogus")
+
+    def test_forced_distributed(self):
+        request_spec, response_spec = _make_shm_specs()
+        transport = make_inference_transport(
+            "distributed",
+            policy_backend="ray",
+            request_spec=request_spec,
+            response_spec=response_spec,
+            transport_options={"timeout": 60.0},
+        )
+        try:
+            assert isinstance(transport, DistributedTransport)
+            assert inference_transport_kind(transport) == "distributed"
+        finally:
+            transport.close()
 
     def test_instance_passthrough(self):
         transport = ThreadingTransport()
@@ -1555,6 +1573,200 @@ class TestServerTransportSelection:
         )
         assert isinstance(server.transport, SharedMemoryTransport)
         assert server.transport_kind == "shared_memory"
+
+
+# =============================================================================
+# Tests: DistributedTransport
+# =============================================================================
+
+
+def _dist_actor_fn(client, n_requests, result_queue):
+    """Actor that submits known values and checks the doubled response."""
+    for i in range(n_requests):
+        obs = torch.full((4,), float(i + 1))
+        result = client(TensorDict({"observation": obs}), timeout=120.0)
+        assert torch.allclose(result["action"], obs * 2.0)
+    result_queue.put(True)
+
+
+class TestDistributedTransport:
+    def _make_transport(self, act_size=4, **kwargs):
+        request_spec = TensorDict({"observation": torch.zeros(4)})
+        response_spec = TensorDict({"action": torch.zeros(act_size)})
+        kwargs.setdefault("timeout", 60.0)
+        return DistributedTransport(request_spec, response_spec, **kwargs)
+
+    def test_single_request_and_out_of_order(self):
+        """In-process round trip; futures can be consumed in any order."""
+        transport = self._make_transport()
+        client = transport.client()
+        policy = TensorDictModule(
+            _Doubler(), in_keys=["observation"], out_keys=["action"]
+        )
+        try:
+            with InferenceServer(policy, transport, max_batch_size=4):
+                obs = torch.arange(4, dtype=torch.float32)
+                result = client(TensorDict({"observation": obs}), timeout=60.0)
+                assert torch.allclose(result["action"], obs * 2.0)
+                fut_a = client.submit(
+                    TensorDict({"observation": torch.full((4,), 1.0)})
+                )
+                fut_b = client.submit(
+                    TensorDict({"observation": torch.full((4,), 2.0)})
+                )
+                result_b = fut_b.result(timeout=30.0)
+                result_a = fut_a.result(timeout=30.0)
+            assert torch.allclose(result_b["action"], torch.full((4,), 4.0))
+            assert torch.allclose(result_a["action"], torch.full((4,), 2.0))
+        finally:
+            transport.close()
+
+    def test_undeclared_keys_are_dropped(self):
+        """Only spec-declared keys travel through the transport."""
+        transport = self._make_transport()
+        client = transport.client()
+        try:
+            with InferenceServer(_make_doubling_policy(), transport, max_batch_size=2):
+                obs = torch.arange(4, dtype=torch.float32)
+                td = TensorDict({"observation": obs, "extra": torch.randn(3)})
+                result = client(td, timeout=60.0)
+                assert set(result.keys()) == {"action"}
+                assert torch.allclose(result["action"], obs * 2.0)
+        finally:
+            transport.close()
+
+    def test_exception_propagates_and_transport_survives(self):
+        """Model errors reach the client; later requests still work."""
+
+        def flaky_model(td):
+            if (td["observation"] < 0).any():
+                raise ValueError("dist model error")
+            return td.set("action", td["observation"] * 2.0)
+
+        transport = self._make_transport()
+        client = transport.client()
+        try:
+            with InferenceServer(flaky_model, transport, max_batch_size=1):
+                with pytest.raises(ValueError, match="dist model error"):
+                    client(TensorDict({"observation": -torch.ones(4)}), timeout=60.0)
+                obs = torch.ones(4)
+                result = client(TensorDict({"observation": obs}), timeout=60.0)
+                assert torch.allclose(result["action"], obs * 2.0)
+        finally:
+            transport.close()
+
+    def test_nested_keys(self):
+        """Nested request and response keys round-trip."""
+        request_spec = TensorDict({"agent": {"observation": torch.zeros(4)}})
+        response_spec = TensorDict({"agent": {"action": torch.zeros(4)}})
+        transport = DistributedTransport(request_spec, response_spec, timeout=60.0)
+        client = transport.client()
+        model = TensorDictModule(
+            _Doubler(),
+            in_keys=[("agent", "observation")],
+            out_keys=[("agent", "action")],
+        )
+        try:
+            with InferenceServer(model, transport, max_batch_size=2):
+                obs = torch.arange(4, dtype=torch.float32)
+                result = client(
+                    TensorDict({"agent": {"observation": obs}}), timeout=60.0
+                )
+                assert torch.allclose(result["agent", "action"], obs * 2.0)
+        finally:
+            transport.close()
+
+    def test_result_timeout_keeps_request(self):
+        """A timed-out result() leaves the request retryable."""
+        transport = self._make_transport(act_size=2)
+        client = transport.client()
+        try:
+            # Start the server-side listener without an InferenceServer so the
+            # request stays unresolved while we probe the timeout behavior.
+            transport.wait_for_work(timeout=0.1)
+            fut = client.submit(TensorDict({"observation": torch.ones(4)}))
+            transport.wait_for_work(timeout=30.0)
+            items, callbacks = transport.drain(4)
+            assert len(items) == 1
+            assert torch.allclose(items[0]["observation"], torch.ones(4))
+            with pytest.raises(queue.Empty):
+                fut.result(timeout=0.2)
+            transport.resolve(callbacks[0], TensorDict({"action": torch.ones(2)}))
+            assert torch.allclose(fut.result(timeout=30.0)["action"], torch.ones(2))
+        finally:
+            transport.close()
+
+    def test_spec_validation(self):
+        response_spec = TensorDict({"action": torch.zeros(2)})
+        with pytest.raises(ValueError, match="Unsupported DistributedTransport"):
+            DistributedTransport(
+                TensorDict({"observation": torch.zeros(4)}),
+                response_spec,
+                backend="mpi",
+            )
+        with pytest.raises(ValueError, match="requires cuda spec tensors"):
+            DistributedTransport(
+                TensorDict({"observation": torch.zeros(4)}),
+                response_spec,
+                backend="nccl",
+            )
+        with pytest.raises(ValueError, match="at least one tensor leaf"):
+            DistributedTransport(TensorDict({}), response_spec)
+        with pytest.raises(TypeError, match="tensor leaves"):
+            DistributedTransport(TensorDict({"instruction": "hello"}), response_spec)
+
+    @pytest.mark.slow
+    def test_cross_process_actors(self):
+        """Spawned child clients rendezvous and submit; parent resolves."""
+        ctx = mp.get_context("spawn")
+        transport = self._make_transport()
+        n_actors = 2
+        result_queue = ctx.Queue()
+        clients = [transport.client() for _ in range(n_actors)]
+        try:
+            with InferenceServer(_make_doubling_policy(), transport, max_batch_size=8):
+                procs = []
+                for i in range(n_actors):
+                    p = ctx.Process(
+                        target=_dist_actor_fn,
+                        args=(clients[i], 5, result_queue),
+                    )
+                    p.start()
+                    procs.append(p)
+                for p in procs:
+                    p.join(timeout=120.0)
+                    assert p.exitcode == 0
+            for _ in range(n_actors):
+                assert result_queue.get(timeout=5.0) is True
+        finally:
+            transport.close()
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(not _has_ray, reason="ray not installed")
+    def test_ray_actor_client(self):
+        """A Ray task moves payloads through torch.distributed, not Ray."""
+        ray = _ray_lib()
+        if not ray.is_initialized():
+            ray.init(num_cpus=4, ignore_reinit_error=True)
+        transport = self._make_transport()
+        client = transport.client()
+
+        @ray.remote
+        def remote_actor_fn(client, n_requests):
+            results = []
+            for i in range(n_requests):
+                obs = torch.full((4,), float(i + 1))
+                result = client(TensorDict({"observation": obs}), timeout=120.0)
+                assert torch.allclose(result["action"], obs * 2.0)
+                results.append(tuple(result["action"].shape))
+            return results
+
+        try:
+            with InferenceServer(_make_doubling_policy(), transport, max_batch_size=8):
+                shapes = ray.get(remote_actor_fn.remote(client, 5), timeout=120.0)
+            assert shapes == [(4,)] * 5
+        finally:
+            transport.close()
 
 
 # =============================================================================

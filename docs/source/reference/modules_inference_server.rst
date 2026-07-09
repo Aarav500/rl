@@ -35,6 +35,7 @@ Transport Backends
     SlotTransport
     MPTransport
     SharedMemoryTransport
+    DistributedTransport
     RayTransport
     MonarchTransport
 
@@ -155,6 +156,27 @@ configs are resolved deterministically by :func:`make_inference_transport`;
   ``response_spec`` provided): :class:`SharedMemoryTransport`;
 - process actors otherwise: :class:`MPTransport`;
 - Ray/Monarch actors: :class:`RayTransport` / :class:`MonarchTransport`.
+
+Placement and payload movement compose independently. In particular, Ray
+placement does not force Ray payloads: ``transport="distributed"`` moves
+fixed-spec payloads between Ray actors (or any remote processes) through
+torch.distributed point-to-point ops -- gloo for CPU tensors, NCCL for
+GPU-direct CUDA tensors -- while headers and exceptions ride small gloo
+control messages. :class:`DistributedTransport` builds standalone pairwise
+process groups rendezvoused through its own
+:class:`~torch.distributed.TCPStore`, so the default process group remains
+free for training collectives. It is never chosen by ``auto`` (it needs a
+static payload contract), so request it explicitly:
+
+.. code-block:: python
+
+    transport = make_inference_transport(
+        "distributed",
+        request_spec=example_obs,
+        response_spec=example_action,
+        transport_options={"backend": "nccl"},  # GPU-direct payloads
+    )
+    clients = [transport.client() for _ in range(n_actors)]  # picklable
 
 Forcing a kind that is incompatible with the topology raises instead of
 silently degrading, and the resolved choice is inspectable through the

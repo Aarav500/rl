@@ -27,6 +27,7 @@ from torchrl._comm import (
     TransportKind,
 )
 from torchrl._utils import logger as torchrl_logger
+from torchrl.modules.inference_server._distributed import DistributedTransport
 from torchrl.modules.inference_server._monarch import MonarchTransport
 from torchrl.modules.inference_server._mp import MPTransport
 from torchrl.modules.inference_server._ray import RayTransport
@@ -49,9 +50,9 @@ def inference_transport_kind(transport: InferenceTransport) -> str:
         transport (InferenceTransport): the transport instance.
 
     Returns:
-        One of ``"direct"``, ``"queue"``, ``"shared_memory"``, ``"ray"``,
-        ``"monarch"``, or ``"custom"`` for transports this module does not
-        know about.
+        One of ``"direct"``, ``"queue"``, ``"shared_memory"``,
+        ``"distributed"``, ``"ray"``, ``"monarch"``, or ``"custom"`` for
+        transports this module does not know about.
 
     Examples:
         >>> from torchrl.modules.inference_server import (
@@ -63,6 +64,8 @@ def inference_transport_kind(transport: InferenceTransport) -> str:
     """
     if isinstance(transport, SharedMemoryTransport):
         return "shared_memory"
+    if isinstance(transport, DistributedTransport):
+        return "distributed"
     if isinstance(transport, SlotTransport):
         return "direct"
     if isinstance(transport, RayTransport):
@@ -130,6 +133,11 @@ def make_inference_transport(
     - ``multiprocessing`` without a payload contract: :class:`MPTransport`;
     - ``ray``: :class:`RayTransport`;
     - ``monarch``: :class:`MonarchTransport`.
+
+    :class:`DistributedTransport` (``transport="distributed"``,
+    torch.distributed point-to-point payloads for Ray or multi-node actors,
+    gloo or NCCL) is never chosen by ``auto``: it requires a static payload
+    contract and a rendezvous, so it must be requested explicitly.
 
     Args:
         transport: ``None`` (compatibility spelling for ``"auto"``), a
@@ -272,6 +280,29 @@ def make_inference_transport(
         resolved = SharedMemoryTransport(
             request_spec, response_spec, num_slots=num_slots, **options
         )
+    elif kind == "distributed":
+        if backend == "threading":
+            raise ValueError(
+                "transport='distributed' moves payloads through "
+                "torch.distributed point-to-point ops and is meant for "
+                "actors in other processes or on other nodes; thread actors "
+                "should use transport='auto' or 'direct'."
+            )
+        missing = [
+            name
+            for name, value in (
+                ("request_spec", request_spec),
+                ("response_spec", response_spec),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "transport='distributed' requires a static payload "
+                f"contract; missing {missing}. Pass them as keyword "
+                "arguments or through transport_options."
+            )
+        resolved = DistributedTransport(request_spec, response_spec, **options)
     elif kind == "ray":
         if backend not in (None, "ray"):
             raise ValueError(
@@ -285,11 +316,11 @@ def make_inference_transport(
                 f"policy_backend={backend!r}."
             )
         resolved = MonarchTransport(**options)
-    else:  # "rpc", "distributed"
+    else:  # "rpc"
         raise ValueError(
             f"transport={kind!r} is not implemented for the inference "
             "domain. Supported kinds: 'auto', 'direct', 'queue', "
-            "'shared_memory', 'ray', 'monarch'."
+            "'shared_memory', 'distributed', 'ray', 'monarch'."
         )
     torchrl_logger.debug(
         f"Resolved inference transport {config.kind!r} with "
