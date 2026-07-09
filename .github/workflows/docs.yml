@@ -63,7 +63,7 @@ jobs:
         # (gym conflicts with gymnasium, torch/torchaudio versions conflict with nightly)
         python -m pip uninstall -y torch torchvision torchaudio gym || true
         
-        if [[ ${{ github.event_name }} == push && (${{ github.ref_type }} == tag || (${{ github.ref_type }} == branch && ${{ github.ref_name }} == release/*)) ]]; then
+        if [[ "${{ github.event_name }}" == push && ("${{ github.ref_type }}" == tag || ("${{ github.ref_type }}" == branch && "${{ github.ref_name }}" == release/*)) ]]; then
           # Use stable PyTorch for releases (tags and release/* branches)
           python -m pip install torch torchvision --quiet --root-user-action=ignore
           python -m pip install cloudpickle packaging importlib_metadata numpy orjson "pyvers>=0.2.3,<0.3.0" --quiet --root-user-action=ignore
@@ -91,7 +91,7 @@ jobs:
         python -m pip install -e . --no-build-isolation --no-deps
 
         # 8. Assert PyTorch version matches expectations
-        if [[ ${{ github.event_name }} == push && (${{ github.ref_type }} == tag || (${{ github.ref_type }} == branch && ${{ github.ref_name }} == release/*)) ]]; then
+        if [[ "${{ github.event_name }}" == push && ("${{ github.ref_type }}" == tag || ("${{ github.ref_type }}" == branch && "${{ github.ref_name }}" == release/*)) ]]; then
           bash .github/unittest/helpers/assert_torch_version.sh stable
           bash .github/unittest/helpers/assert_torch_tensordict_versions.sh stable
         else
@@ -100,7 +100,7 @@ jobs:
         fi
 
         # 9. Set sanitize version
-        if [[ ${{ github.event_name }} == push && (${{ github.ref_type }} == tag || (${{ github.ref_type }} == branch && ${{ github.ref_name }} == release/*)) ]]; then
+        if [[ "${{ github.event_name }}" == push && ("${{ github.ref_type }}" == tag || ("${{ github.ref_type }}" == branch && "${{ github.ref_name }}" == release/*)) ]]; then
           echo '::group::Enable version string sanitization'
           # This environment variable just has to exist and must not be empty. The actual value is arbitrary.
           # See docs/source/conf.py for details
@@ -144,7 +144,7 @@ jobs:
 
         cp -r docs/_local_build/* "${RUNNER_ARTIFACT_DIR}"
         echo $(ls "${RUNNER_ARTIFACT_DIR}")
-        if [[ ${{ github.event_name == 'pull_request' }} ]]; then
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
           cp -r docs/_local_build/* "${RUNNER_DOCS_DIR}"
         fi
 
