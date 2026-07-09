@@ -378,6 +378,18 @@ class DistributedTransport(InferenceTransport):
         Requests are copied into fixed staging buffers on both sides (one
         payload copy per direction); nothing is pickled on the hot path.
 
+    .. warning::
+        Like all of :mod:`torch.distributed`, this transport provides no
+        authentication or encryption: the rendezvous
+        :class:`~torch.distributed.TCPStore` accepts any connection (and
+        listens on all network interfaces regardless of ``host``), and the
+        gloo/NCCL payload channels are unauthenticated. Note that received
+        headers and exception payloads are deserialized with ``pickle``,
+        which can execute arbitrary code, so an attacker with network access
+        to the store or channel ports can compromise every participating
+        process. Only deploy on trusted, isolated networks (e.g. a cluster
+        fabric behind a firewall), as with any ``torch.distributed`` job.
+
     Example:
         >>> import torch
         >>> from tensordict import TensorDict
@@ -430,9 +442,12 @@ class DistributedTransport(InferenceTransport):
         if host is None:
             host = socket.gethostbyname(socket.gethostname())
         if port is None:
+            # Probe for a free port on the interface we will advertise.
+            # Binding the probe to ``host`` (never the wildcard address)
+            # also validates early that ``host`` is a local address.
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind(("", 0))
+                sock.bind((host, 0))
                 port = sock.getsockname()[1]
         self._store_info = (host, port)
         # The owner keeps the master store alive; unpickled copies (e.g. a
