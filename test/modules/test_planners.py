@@ -329,6 +329,33 @@ class TestPlanner:
 
         torch.testing.assert_close(plan(offset), plan(0.0))
 
+    def test_MPPI_independent_batch_offsets(self, device, batch_size, seed=1):
+        # Each env in the batch gets its own constant offset. The max subtracted
+        # before exp must be taken per env: a max over the whole batch would
+        # leave the low-offset envs far below zero, their weights would
+        # underflow to 0/0, and the plan would change. A single shared offset
+        # cannot tell the two apart.
+        offsets = torch.linspace(-200, 200, batch_size, device=device).reshape(
+            batch_size, 1, 1, 1
+        )
+
+        def plan(advantage_offset):
+            torch.manual_seed(seed)
+            env = MockBatchedUnLockedEnv(device=device)
+            planner = MPPIPlanner(
+                env,
+                _OffsetAdvantage(advantage_offset),
+                temperature=1.0,
+                planning_horizon=5,
+                optim_steps=2,
+                num_candidates=20,
+                top_k=4,
+            )
+            td = env.reset(TensorDict(batch_size=batch_size).to(device))
+            return planner(td).get("action")
+
+        torch.testing.assert_close(plan(offsets), plan(torch.zeros_like(offsets)))
+
 
 @pytest.mark.parametrize("device", get_default_devices())
 class TestPlannerDoneMask:
